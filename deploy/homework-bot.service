@@ -1,0 +1,28 @@
+# Вариант запуска на сервере без Docker (сценарий C).
+# Установка:
+#   sudo cp deploy/homework-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now homework-bot
+
+[Unit]
+Description=HomeWork_2 Telegram LLM bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=homework-bot
+WorkingDirectory=/opt/homework-bot
+# Секреты лежат вне репозитория, chmod 600, владелец — homework-bot
+EnvironmentFile=/etc/homework-bot.env
+ExecStart=/usr/bin/python3 -m bot.main
+Restart=always
+RestartSec=5
+
+# Минимальное усиление безопасности
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
