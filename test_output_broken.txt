@@ -1,0 +1,3 @@
+Broken links: 2
+- /mnt/data/linkcheck_test/docs/test.md: missing.txt -> file not found
+- /mnt/data/linkcheck_test/docs/test.md: http://127.0.0.1:8765/missing.html -> HTTP 404
