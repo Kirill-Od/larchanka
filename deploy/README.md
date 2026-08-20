@@ -59,6 +59,11 @@ journalctl -u homework-bot -f
 
 Ollama ставится отдельно (`curl -fsSL https://ollama.com/install.sh | sh`), работает как свой systemd-сервис на `localhost:11434`.
 
+## Сценарий E: Railway (PaaS)
+
+Два сервиса в одном проекте, приватная сеть, volume под модель —
+пошагово в [railway.md](railway.md).
+
 ## Сценарий D: Ollama на отдельной машине
 
 Если у VPS мало RAM, оставь на нём только бота, а модель держи на машине помощнее:

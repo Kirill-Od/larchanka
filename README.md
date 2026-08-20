@@ -110,7 +110,8 @@ class MyProvider(LLMProvider):
 
 ## Запуск на сервере
 
-Docker Compose, systemd и вынесенная Ollama — в [deploy/README.md](deploy/README.md). Коротко:
+Docker Compose, systemd, Railway и вынесенная Ollama — в [deploy/README.md](deploy/README.md)
+(Railway — отдельно в [deploy/railway.md](deploy/railway.md)). Коротко:
 
 ```bash
 cp .env.example .env && nano .env && chmod 600 .env
