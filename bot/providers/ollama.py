@@ -1,6 +1,6 @@
 """Провайдер локальной модели через Ollama (/api/generate).
 
-Настройки: OLLAMA_URL, OLLAMA_MODEL.
+Настройки: OLLAMA_URL, OLLAMA_MODEL, OLLAMA_NUM_THREAD.
 """
 
 from __future__ import annotations
@@ -22,6 +22,18 @@ class OllamaProvider(LLMProvider):
         self._base_url = settings.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
         self._model = settings.get("OLLAMA_MODEL", "qwen3:1.7b")
 
+        # В контейнере Ollama видит все ядра хоста и запускает поток на каждое,
+        # хотя cgroup выделяет заметно меньше. Потоки начинают душить друг друга:
+        # на Railway (48 ядер хоста, квота 24) это разница в 25 раз — 0.8 ток/с
+        # против 20. Поэтому число потоков задаётся явно.
+        self._options: dict[str, int] = {}
+        threads = settings.get("OLLAMA_NUM_THREAD", "").strip()
+        if threads:
+            try:
+                self._options["num_thread"] = int(threads)
+            except ValueError:
+                pass
+
     @property
     def model(self) -> str:
         return self._model
@@ -32,9 +44,12 @@ class OllamaProvider(LLMProvider):
         return ""
 
     def generate(self, prompt: str) -> str:
+        payload: dict = {"model": self._model, "prompt": prompt, "stream": False}
+        if self._options:
+            payload["options"] = self._options
         data = post_json(
             f"{self._base_url}/api/generate",
-            {"model": self._model, "prompt": prompt, "stream": False},
+            payload,
             self._timeout,
             on_http_error=self._http_error,
         )
