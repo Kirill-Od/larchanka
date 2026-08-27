@@ -9,10 +9,10 @@ LLM_PROVIDER=openai_compat, ни одна другая строка кода н�
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
-from bot.core.contracts import LLMError, LLMProvider
-from bot.core.text import strip_reasoning
+from bot.core.contracts import LLMError, LLMProvider, Message
+from bot.core.text import strip_reasoning, to_api_messages
 from bot.providers import register
 from bot.providers._http import is_reachable, post_json
 
@@ -32,12 +32,15 @@ class OpenAICompatProvider(LLMProvider):
         return self._model
 
     def generate(self, prompt: str) -> str:
+        return self.chat([Message("user", prompt)])
+
+    def chat(self, messages: Sequence[Message]) -> str:
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         data = post_json(
             f"{self._base_url}/chat/completions",
             {
                 "model": self._model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": to_api_messages(messages),
                 "stream": False,
             },
             self._timeout,

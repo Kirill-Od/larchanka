@@ -1,8 +1,11 @@
 """Тело рабочего процесса агента.
 
-Процесс живёт отдельно от бота: сеть Telegram и инференс полностью изолированы.
-Падение или зависание модели не роняет бота — процесс просто убивается
-и поднимается заново.
+Процесс живёт отдельно от бота: сеть Telegram, инференс и — что важнее —
+выполнение команд полностью изолированы. Падение, зависание или тяжёлая
+команда не роняют бота: процесс убивается и поднимается заново.
+
+Провайдер, инструменты и скиллы создаются здесь, внутри процесса, и живут
+до его смерти: перечитывать скиллы с диска на каждый запрос незачем.
 """
 
 from __future__ import annotations
@@ -14,8 +17,10 @@ import signal
 import time
 from typing import Any
 
+from bot.agent.harness import Harness
+from bot.agent.protocol import Claim, Result, Step, Task
+from bot.agent.skills import SkillLibrary
 from bot.core.contracts import LLMError
-from bot.agent.protocol import Claim, Result, Task
 
 logger = logging.getLogger("agent.worker")
 
@@ -27,6 +32,8 @@ def worker_main(
     settings: dict[str, str],
     timeout: int,
     log_level: str,
+    max_steps: int = 8,
+    task_timeout: float = 300.0,
 ) -> None:
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
@@ -36,11 +43,16 @@ def worker_main(
     # Ctrl+C обрабатывает родитель: воркер завершается по сигнальной задаче None.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    from bot import providers  # импорт внутри процесса: реестр строится заново
+    from bot import providers, tools  # импорт внутри процесса: реестры строятся заново
 
+    toolset = tools.create_all(settings)
+    skills = SkillLibrary.load(settings.get("SKILLS_DIR", ""))
     provider = None
     pid = os.getpid()
-    logger.info("Рабочий процесс агента запущен (провайдер %s)", provider_name)
+    logger.info(
+        "Рабочий процесс агента запущен: провайдер %s, инструменты [%s], скиллы [%s]",
+        provider_name, ", ".join(toolset) or "—", ", ".join(skills.names()) or "—",
+    )
 
     while True:
         try:
@@ -62,16 +74,31 @@ def worker_main(
                 # Ленивое создание: ошибка конфигурации станет ответом на задачу,
                 # а не молчаливой смертью процесса на старте.
                 provider = providers.create(provider_name, settings, timeout)
-            text = provider.generate(task.prompt)
+            harness = Harness(
+                provider=provider,
+                tools=toolset,
+                skills=skills,
+                max_steps=max_steps,
+                time_budget=task_timeout,
+                on_step=lambda text, tid=task.task_id: result_queue.put(Step(tid, text)),
+            )
+            run = harness.run(task.messages)
             result_queue.put(
-                Result(task.task_id, True, text=text, elapsed=time.monotonic() - started)
+                Result(
+                    task.task_id, True,
+                    text=run.text,
+                    elapsed=time.monotonic() - started,
+                    trace=run.trace,
+                    steps=run.steps,
+                    stopped=run.stopped,
+                )
             )
         except LLMError as exc:
             result_queue.put(
                 Result(task.task_id, False, error=str(exc), elapsed=time.monotonic() - started)
             )
         except Exception as exc:  # noqa: BLE001 — воркер не имеет права падать молча
-            logger.exception("Ошибка инференса")
+            logger.exception("Ошибка в цикле агента")
             result_queue.put(
                 Result(
                     task.task_id,

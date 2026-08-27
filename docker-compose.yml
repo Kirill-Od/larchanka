@@ -21,6 +21,10 @@ services:
     environment:
       # Перекрывает значение из .env: внутри compose Ollama живёт по имени сервиса
       OLLAMA_URL: http://ollama:11434
+    # Скиллы — обычные .md: правим на хосте и перезапускаем бота, без пересборки.
+    volumes:
+      - ./skills:/app/skills:ro
+      - ./data:/app/data
     depends_on:
       ollama:
         condition: service_healthy

@@ -60,6 +60,13 @@ def _parse_user_ids(raw: str) -> frozenset[int]:
     return frozenset(ids)
 
 
+def _parse_bool(raw: str, default: bool) -> bool:
+    raw = raw.strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "да")
+
+
 def _parse_positive_int(raw: str, name: str, default: int) -> int:
     raw = raw.strip()
     if not raw:
@@ -81,6 +88,14 @@ class Config:
     llm_timeout: int
     poll_timeout: int
     agent_workers: int
+    #: Потолок шагов агентного цикла — защита от зацикливания.
+    agent_max_steps: int
+    #: Общий бюджет времени на один запрос: шагов несколько, таймаут у каждого свой.
+    agent_task_timeout: int
+    #: Показывать ли в чате, какой инструмент агент вызывает прямо сейчас.
+    agent_show_steps: bool
+    history_max_messages: int
+    history_max_chars: int
     allowed_user_ids: frozenset[int]
     log_level: str
     #: Все значения .env + окружения целиком. Плагины читают отсюда свои ключи,
@@ -130,6 +145,17 @@ def load_config(env_path: Path | None = None) -> Config:
         llm_timeout=_parse_positive_int(get("LLM_TIMEOUT"), "LLM_TIMEOUT", 120),
         poll_timeout=_parse_positive_int(get("POLL_TIMEOUT"), "POLL_TIMEOUT", 30),
         agent_workers=_parse_positive_int(get("AGENT_WORKERS"), "AGENT_WORKERS", 1),
+        agent_max_steps=_parse_positive_int(get("AGENT_MAX_STEPS"), "AGENT_MAX_STEPS", 8),
+        agent_task_timeout=_parse_positive_int(
+            get("AGENT_TASK_TIMEOUT"), "AGENT_TASK_TIMEOUT", 300
+        ),
+        agent_show_steps=_parse_bool(get("AGENT_SHOW_STEPS"), True),
+        history_max_messages=_parse_positive_int(
+            get("HISTORY_MAX_MESSAGES"), "HISTORY_MAX_MESSAGES", 40
+        ),
+        history_max_chars=_parse_positive_int(
+            get("HISTORY_MAX_CHARS"), "HISTORY_MAX_CHARS", 12000
+        ),
         allowed_user_ids=_parse_user_ids(get("ALLOWED_USER_IDS")),
         log_level=get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         settings=merged,

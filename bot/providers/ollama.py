@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
-from bot.core.contracts import LLMError, LLMProvider
-from bot.core.text import strip_reasoning
+from bot.core.contracts import LLMError, LLMProvider, Message
+from bot.core.text import strip_reasoning, to_api_messages
 from bot.providers import register
 from bot.providers._http import is_reachable, post_json
 
@@ -43,17 +43,35 @@ class OllamaProvider(LLMProvider):
             return f"модель {self._model!r} не найдена. Скачай её: `ollama pull {self._model}`"
         return ""
 
-    def generate(self, prompt: str) -> str:
-        payload: dict = {"model": self._model, "prompt": prompt, "stream": False}
+    def _payload(self, extra: dict) -> dict:
+        payload: dict = {"model": self._model, "stream": False, **extra}
         if self._options:
             payload["options"] = self._options
+        return payload
+
+    def generate(self, prompt: str) -> str:
         data = post_json(
             f"{self._base_url}/api/generate",
-            payload,
+            self._payload({"prompt": prompt}),
             self._timeout,
             on_http_error=self._http_error,
         )
-        answer = strip_reasoning(data.get("response", ""))
+        return self._answer(data.get("response", ""))
+
+    def chat(self, messages: Sequence[Message]) -> str:
+        """Агентный цикл идёт через /api/chat: роли модель понимает лучше,
+        чем один склеенный промпт, а Ollama сама применяет шаблон модели."""
+        data = post_json(
+            f"{self._base_url}/api/chat",
+            self._payload({"messages": to_api_messages(messages)}),
+            self._timeout,
+            on_http_error=self._http_error,
+        )
+        return self._answer((data.get("message") or {}).get("content", ""))
+
+    @staticmethod
+    def _answer(raw: str) -> str:
+        answer = strip_reasoning(raw)
         if not answer:
             raise LLMError("модель вернула пустой ответ")
         return answer

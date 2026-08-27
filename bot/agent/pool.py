@@ -13,16 +13,17 @@ import multiprocessing
 import queue as queue_mod
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from bot.agent.protocol import Claim, Result, Task
+from bot.agent.protocol import Claim, Result, Step, Task
 from bot.agent.worker import worker_main
+from bot.core.contracts import Message
 
 logger = logging.getLogger("agent.pool")
 
-# Запас поверх таймаута провайдера: сначала должен сработать его собственный
-# таймаут с понятным текстом, и только зависший наглухо процесс убиваем силой.
+# Запас поверх бюджета задачи: сначала должен сработать дедлайн харнесса
+# с понятным текстом, и только зависший наглухо процесс убиваем силой.
 KILL_MARGIN_SECONDS = 15
 
 
@@ -38,6 +39,18 @@ class AgentTimeout(AgentError):
 class _Slot:
     event: threading.Event
     result: Result | None = None
+    #: Куда лить промежуточные шаги цикла (в чат — «⚙️ exec: …»).
+    on_step: Callable[[str], None] | None = None
+
+
+@dataclass(frozen=True)
+class AgentAnswer:
+    """Ответ агента вместе с тем, что он добавил в контекст чата."""
+
+    text: str
+    trace: tuple[Message, ...] = ()
+    steps: int = 0
+    stopped: str = "answer"
 
 
 class AgentPool:
@@ -48,10 +61,16 @@ class AgentPool:
         timeout: int,
         workers: int = 1,
         log_level: str = "INFO",
+        max_steps: int = 8,
+        task_timeout: int = 300,
     ):
         self._provider_name = provider_name
         self._settings = dict(settings)
         self._timeout = timeout
+        self._max_steps = max_steps
+        # Один запрос — это несколько вызовов модели плюс работа инструментов,
+        # поэтому ждём бюджет задачи, а не таймаут одного вызова.
+        self._task_timeout = task_timeout
         self._workers_count = max(1, workers)
         self._log_level = log_level
 
@@ -92,6 +111,8 @@ class AgentPool:
                 self._settings,
                 self._timeout,
                 self._log_level,
+                self._max_steps,
+                float(self._task_timeout),
             ),
             daemon=True,
         )
@@ -129,6 +150,16 @@ class AgentPool:
                 with self._lock:
                     self._claims[message.task_id] = message.pid
                 continue
+            if isinstance(message, Step):
+                with self._lock:
+                    slot = self._slots.get(message.task_id)
+                callback = slot.on_step if slot else None
+                if callback is not None:
+                    try:
+                        callback(message.text)
+                    except Exception:  # noqa: BLE001 — UI не должен ломать цикл
+                        logger.exception("Обработчик шага упал")
+                continue
             if not isinstance(message, Result):
                 continue
             with self._lock:
@@ -157,24 +188,28 @@ class AgentPool:
 
     # --- вызов ------------------------------------------------------------
 
-    def run(self, prompt: str) -> str:
-        """Синхронный вызов агента. Потокобезопасен: webhook-транспорт
-        обрабатывает апдейты в нескольких потоках."""
+    def run(
+        self,
+        messages: Sequence[Message],
+        on_step: Callable[[str], None] | None = None,
+    ) -> AgentAnswer:
+        """Синхронный вызов агента с контекстом чата. Потокобезопасен:
+        webhook-транспорт обрабатывает апдейты в нескольких потоках."""
         if self._stopping.is_set():
             raise AgentError("агент остановлен")
 
-        task = Task(uuid.uuid4().hex, prompt)
-        slot = _Slot(threading.Event())
+        task = Task(uuid.uuid4().hex, tuple(messages))
+        slot = _Slot(threading.Event(), on_step=on_step)
         with self._lock:
             self._slots[task.task_id] = slot
 
         try:
             self._task_queue.put(task)
-            if not slot.event.wait(self._timeout + KILL_MARGIN_SECONDS):
+            if not slot.event.wait(self._task_timeout + KILL_MARGIN_SECONDS):
                 self._kill_task_owner(task.task_id)
                 raise AgentTimeout(
                     f"процесс агента завис и был перезапущен "
-                    f"(лимит {self._timeout} с)"
+                    f"(лимит {self._task_timeout} с)"
                 )
             result = slot.result
         finally:
@@ -183,8 +218,11 @@ class AgentPool:
 
         if result is None or not result.ok:
             raise AgentError(result.error if result else "агент не вернул ответ")
-        logger.debug("Задача %s выполнена за %.1f с", task.task_id[:8], result.elapsed)
-        return result.text
+        logger.debug(
+            "Задача %s выполнена за %.1f с, шагов %d (%s)",
+            task.task_id[:8], result.elapsed, result.steps, result.stopped,
+        )
+        return AgentAnswer(result.text, result.trace, result.steps, result.stopped)
 
     def _kill_task_owner(self, task_id: str) -> None:
         with self._lock:
