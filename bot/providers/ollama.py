@@ -38,6 +38,18 @@ class OllamaProvider(LLMProvider):
     def model(self) -> str:
         return self._model
 
+    @property
+    def _hint(self) -> str:
+        """Самая частая причина отказа — дефолтный localhost в контейнере,
+        где Ollama живёт под другим именем."""
+        if "localhost" in self._base_url or "127.0.0.1" in self._base_url:
+            return (
+                "Если бот в контейнере, localhost — это сам контейнер: задай "
+                "OLLAMA_URL (docker compose — http://ollama:11434, Railway — "
+                "http://ollama.railway.internal:11434)"
+            )
+        return "Проверь, что Ollama запущена и OLLAMA_URL указывает на неё"
+
     def _http_error(self, code: int, detail: str) -> str:
         if code == 404:
             return f"модель {self._model!r} не найдена. Скачай её: `ollama pull {self._model}`"
@@ -55,6 +67,7 @@ class OllamaProvider(LLMProvider):
             self._payload({"prompt": prompt}),
             self._timeout,
             on_http_error=self._http_error,
+            unreachable_hint=self._hint,
         )
         return self._answer(data.get("response", ""))
 
@@ -66,6 +79,7 @@ class OllamaProvider(LLMProvider):
             self._payload({"messages": to_api_messages(messages)}),
             self._timeout,
             on_http_error=self._http_error,
+            unreachable_hint=self._hint,
         )
         return self._answer((data.get("message") or {}).get("content", ""))
 

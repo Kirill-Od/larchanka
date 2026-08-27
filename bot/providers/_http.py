@@ -17,6 +17,7 @@ def post_json(
     timeout: int,
     headers: dict[str, str] | None = None,
     on_http_error: Any = None,
+    unreachable_hint: str = "",
 ) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
@@ -44,7 +45,10 @@ def post_json(
     except (socket.timeout, TimeoutError):
         raise LLMError(f"модель не ответила за {timeout} с") from None
     except urllib.error.URLError as exc:
-        raise LLMError(f"сервис недоступен по адресу {url} ({exc.reason})") from None
+        message = f"сервис недоступен по адресу {url} ({exc.reason})"
+        if unreachable_hint:
+            message = f"{message}. {unreachable_hint}"
+        raise LLMError(message) from None
     except json.JSONDecodeError as exc:
         raise LLMError(f"некорректный JSON в ответе ({exc})") from None
 
