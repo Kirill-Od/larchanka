@@ -98,6 +98,24 @@ FINAL_NUDGE = (
     "Если чего-то узнать не удалось — честно скажи об этом."
 )
 
+#: Приклеивается к любой неудаче инструмента. Мелкая модель, получив ошибку,
+#: охотно закрывает задачу правдоподобным текстом вместо второй попытки —
+#: напоминание о том, что сбой это не данные, стоит дешевле лишнего шага.
+ERROR_NUDGE = (
+    "Это сбой вызова, а не данные. Исправь вызов и повтори — имя бери из "
+    "списка доступных выше. Подставлять вместо результата правдоподобные "
+    "значения запрещено: пока инструмент не отработал, данных у тебя нет."
+)
+
+#: Показывается модели, когда она «отвечает» после единственного упавшего
+#: вызова: собранных данных в этот момент нет, значит ответ выдуман.
+FABRICATION_GUARD = (
+    "СТОП: ни один инструмент ещё не отработал, последний вызов упал. "
+    "Данных для ответа у тебя нет — значит ответ выше выдуман, "
+    "пользователь его не увидит. Сделай правильный вызов инструмента сейчас. "
+    "Если инструментами задача не решается — так и скажи, честно и без цифр."
+)
+
 NO_SKILLS_HINT = " (пока не добавлено ни одного — работай инструментами напрямую)"
 SKILLS_HINT = (
     " — если задача похожа на одну из них, ПЕРВЫМ делом прочитай инструкцию "
@@ -252,6 +270,11 @@ def strip_tool_blocks(reply: str) -> str:
 # --- цикл -----------------------------------------------------------------
 
 
+def _failure(detail: str) -> str:
+    """Единый вид неудачи инструмента: причина плюс запрет на выдумку."""
+    return f"ОШИБКА: {detail}\n{ERROR_NUDGE}"
+
+
 @dataclass
 class Harness:
     provider: LLMProvider
@@ -292,6 +315,11 @@ class Harness:
         deadline = time.monotonic() + self.time_budget
         history: list[str] = []
         stopped = "answer"
+        #: Отработал ли хоть один инструмент — от этого зависит, есть ли
+        #: у модели вообще данные для финального ответа.
+        tool_succeeded = False
+        last_call_failed = False
+        guarded = False
 
         for step in range(1, self.max_steps + 1):
             out_of_time = time.monotonic() >= deadline
@@ -309,6 +337,7 @@ class Harness:
                 # Оборванное действие — не ответ. Возвращаем модели её ошибку,
                 # чтобы она переписала вызов, а не показываем битый JSON человеку.
                 logger.warning("Не разобран вызов инструмента на шаге %d", step)
+                last_call_failed = True
                 observation = (
                     "ОШИБКА: не смог разобрать вызов инструмента. Пришли ровно "
                     "один блок ```tool с корректным JSON: кавычки внутри значения "
@@ -321,6 +350,17 @@ class Harness:
                 continue
 
             if call is None:
+                if not last_step and last_call_failed and not tool_succeeded and not guarded:
+                    # Единственный вызов упал, а модель уже «ответила»: взяться
+                    # данным неоткуда, это выдумка. Даём один шанс исправиться.
+                    logger.warning("Ответ после упавшего вызова — похоже на выдумку")
+                    guarded = True
+                    # В trace не кладём намеренно: выдуманный ответ не должен
+                    # попасть в историю чата. Модели он нужен, человеку — нет.
+                    context.append(Message("assistant", reply.strip()))
+                    context.append(Message("system", FABRICATION_GUARD))
+                    continue
+
                 text = strip_tool_blocks(reply) if last_step else reply.strip()
                 if not text:
                     text = (
@@ -349,7 +389,9 @@ class Harness:
             if self.on_step is not None:
                 self.on_step(call.short())
 
-            observation = self._invoke(call)
+            observation, ok = self._invoke(call)
+            tool_succeeded = tool_succeeded or ok
+            last_call_failed = not ok
             trace.append(Message("assistant", reply.strip()))
             trace.append(Message("tool", observation))
             context.append(Message("assistant", reply.strip()))
@@ -358,16 +400,17 @@ class Harness:
         # Сюда не попадаем: последний шаг всегда возвращает ответ.
         raise AssertionError("агентный цикл завершился без ответа")
 
-    def _invoke(self, call: ToolCall) -> str:
+    def _invoke(self, call: ToolCall) -> tuple[str, bool]:
+        """Возвращает наблюдение для модели и признак того, что вызов удался."""
         tool = self.tools.get(call.name)
         if tool is None:
             available = ", ".join(self.tools) or "—"
-            return f"ОШИБКА: инструмента {call.name!r} нет. Доступны: {available}"
+            return _failure(f"инструмента {call.name!r} нет. Доступны: {available}"), False
         try:
             result = tool.run(call.args)
         except ToolError as exc:
-            return f"ОШИБКА: {exc}"
+            return _failure(str(exc)), False
         except Exception as exc:  # noqa: BLE001 — сбой инструмента не роняет цикл
             logger.exception("Инструмент %s упал", call.name)
-            return f"ОШИБКА: инструмент {call.name} упал ({exc.__class__.__name__})"
-        return truncate(str(result), MAX_OBSERVATION_CHARS, "вывод обрезан")
+            return _failure(f"инструмент {call.name} упал ({exc.__class__.__name__})"), False
+        return truncate(str(result), MAX_OBSERVATION_CHARS, "вывод обрезан"), True

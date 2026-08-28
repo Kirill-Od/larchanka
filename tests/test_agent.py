@@ -12,7 +12,13 @@ import unittest
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from bot.agent.harness import Harness, parse_tool_call, strip_tool_blocks
+from bot.agent.harness import (
+    ERROR_NUDGE,
+    FABRICATION_GUARD,
+    Harness,
+    parse_tool_call,
+    strip_tool_blocks,
+)
 from bot.agent.skills import SkillLibrary
 from bot.core.contracts import LLMProvider, Message, Tool, ToolError
 from bot.core.history import ConversationStore
@@ -140,18 +146,61 @@ class HarnessTest(unittest.TestCase):
         self.assertIn("застрял", run.text)
 
     def test_tool_error_goes_back_to_model(self) -> None:
-        provider = ScriptedProvider([call("broken"), "Инструмент сломан, вот что я знаю…"])
+        provider = ScriptedProvider(
+            [call("broken"), "выдумка", "Инструмент сломан, данных нет."]
+        )
         run = Harness(provider, {"broken": FailingTool({})}).run([Message("user", "?")])
 
-        self.assertIn("так и было задумано", provider.seen[1][-1].content)
-        self.assertEqual(run.text, "Инструмент сломан, вот что я знаю…")
+        observation = provider.seen[1][-1].content
+        self.assertIn("так и было задумано", observation)
+        # К причине приклеен запрет на выдумку: без него мелкая модель
+        # закрывает задачу правдоподобным текстом вместо второй попытки.
+        self.assertIn(ERROR_NUDGE, observation)
+        self.assertEqual(run.text, "Инструмент сломан, данных нет.")
 
     def test_unknown_tool_is_reported_not_fatal(self) -> None:
-        provider = ScriptedProvider([call("нетакого"), "Ладно, отвечаю сам."])
+        provider = ScriptedProvider([call("нетакого"), "выдумка", "Ладно, отвечаю сам."])
         run = Harness(provider, {"ping": CountingTool()}).run([Message("user", "?")])
 
         self.assertIn("нет", provider.seen[1][-1].content)
         self.assertEqual(run.text, "Ладно, отвечаю сам.")
+
+    def test_answer_after_the_only_failed_call_is_rejected(self) -> None:
+        """Вызов упал, данных нет — «ответ» в этот момент может быть только
+        выдуман. Цикл обязан вернуть модель к инструментам, а не к человеку."""
+        tool = CountingTool()
+        provider = ScriptedProvider(
+            [call("broken"), "Погода в Москве: солнечно, +25.", call("ping"), "Итог: pong #1"]
+        )
+        run = Harness(provider, {"broken": FailingTool({}), "ping": tool}).run(
+            [Message("user", "сводку")]
+        )
+
+        self.assertEqual(run.text, "Итог: pong #1")
+        self.assertEqual(run.stopped, "answer")
+        self.assertEqual(tool.calls, [{}])
+        self.assertIn(FABRICATION_GUARD, provider.seen[2][-1].content)
+        # Выдумка нужна была только модели: в историю чата она не уезжает.
+        self.assertNotIn("Москве", " ".join(m.content for m in run.trace))
+
+    def test_fabrication_guard_gives_exactly_one_chance(self) -> None:
+        """Модель настояла на своём — спорить дальше некому, отдаём ответ."""
+        provider = ScriptedProvider([call("broken"), "первый ответ", "второй ответ"])
+        run = Harness(provider, {"broken": FailingTool({})}).run([Message("user", "?")])
+
+        self.assertEqual(run.text, "второй ответ")
+        self.assertEqual(run.steps, 3)
+
+    def test_guard_is_silent_once_a_tool_has_worked(self) -> None:
+        """Один инструмент отработал — данные есть, ответ после сбоя второго
+        законен: скилл прочитан, а погода честно недоступна."""
+        provider = ScriptedProvider([call("ping"), call("broken"), "pong есть, остального нет"])
+        run = Harness(provider, {"ping": CountingTool(), "broken": FailingTool({})}).run(
+            [Message("user", "?")]
+        )
+
+        self.assertEqual(run.text, "pong есть, остального нет")
+        self.assertEqual(run.steps, 3)
 
     def test_system_prompt_lists_tools_and_skills(self) -> None:
         harness = Harness(
