@@ -12,10 +12,16 @@
 
     ---
     name: morning-briefing
+    kind: procedure
     description: утренняя сводка: погода, дела на день, итог
     ---
 
     1. ...
+
+Ключ kind разделяет скиллы на процедуры (шаги, которые надо выполнить по
+порядку) и справочники (что взять и вернуться к своей задаче). Инструмент
+skill дописывает к телу разное напоминание: мелкая модель иначе выполняет
+первый попавшийся код-блок справочника как первый шаг плана.
 """
 
 from __future__ import annotations
@@ -33,13 +39,18 @@ DEFAULT_SKILLS_DIR = PROJECT_ROOT / "skills"
 #: Ограничение на тело одного скилла: инструкция должна влезать в контекст.
 MAX_SKILL_CHARS = 6000
 
+#: Типы скиллов. procedure — план из шагов, reference — справка по CLI/API.
+KINDS = ("procedure", "reference")
+DEFAULT_KIND = "procedure"
+
 
 @dataclass(frozen=True)
 class Skill:
     name: str
     description: str
     body: str
-    path: Path
+    #: procedure или reference, см. KINDS.
+    kind: str = DEFAULT_KIND
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -72,6 +83,20 @@ def _load_file(path: Path) -> Skill | None:
         logger.warning("Скилл %s пуст, пропускаю", path.name)
         return None
 
+    if len(body) > MAX_SKILL_CHARS:
+        logger.warning(
+            "Скилл %s длиннее %d символов, обрезан на %d — разбей его на части",
+            path.name, MAX_SKILL_CHARS, len(body) - MAX_SKILL_CHARS,
+        )
+        body = body[:MAX_SKILL_CHARS]
+
+    kind = meta.get("kind", DEFAULT_KIND).strip().lower() or DEFAULT_KIND
+    if kind not in KINDS:
+        logger.warning(
+            "Скилл %s: неизвестный kind %r, считаю его %s", path.name, kind, DEFAULT_KIND
+        )
+        kind = DEFAULT_KIND
+
     description = meta.get("description", "")
     if not description:
         # Без описания скилл невидим для модели — берём первую строку тела.
@@ -81,8 +106,8 @@ def _load_file(path: Path) -> Skill | None:
     return Skill(
         name=meta.get("name") or path.stem,
         description=description,
-        body=body[:MAX_SKILL_CHARS],
-        path=path,
+        body=body,
+        kind=kind,
     )
 
 

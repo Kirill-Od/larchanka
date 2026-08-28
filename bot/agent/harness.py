@@ -39,6 +39,12 @@ DEFAULT_MAX_STEPS = 8
 MAX_ALLOWED_STEPS = 10
 #: Сколько раз подряд терпим один и тот же вызов, прежде чем оборвать цикл.
 MAX_REPEATS = 2
+#: Сколько бесплодных шагов подряд считаем топтанием на месте. Бесплодный —
+#: это повтор уже сделанного вызова или вызов, который не удалось разобрать:
+#: в обоих случаях новых данных не появилось. Модель, собравшая всё нужное,
+#: любит начать процедуру скилла заново или сорваться в битый JSON, и ждать
+#: до потолка шагов бессмысленно — лучше сразу попросить ответ.
+MAX_STALLED_STEPS = 2
 #: Сколько пустых ответов модели терпим, прежде чем свернуть задачу.
 MAX_EMPTY_REPLIES = 2
 #: Ограничение на результат одного вызова в контексте.
@@ -59,6 +65,13 @@ _LOOKS_LIKE_CALL = re.compile(r'```(?:tool|json|tool_call)|<tool|"(?:tool|tool_n
 # последнюю кавычку перед закрывающей скобкой — то есть весь аргумент целиком.
 _LOOSE_NAME = re.compile(r'"(?:tool|tool_name|action|name)"\s*:\s*"([\w.\-]+)"')
 _LOOSE_ARG = re.compile(r'"(command|cmd|name|skill|query)"\s*:\s*"(.+)"\s*\}', re.DOTALL)
+# Вторая любимая поломка: закрывающая кавычка уезжает за скобки — модель пишет
+# {"args": {"command": "curl …'}}"  вместо  {"args": {"command": "curl …'"}}.
+# JSON разваливается целиком, и обычные регулярки его уже не берут: после
+# кавычки нет скобки, за которую они цепляются. Меняем хвост местами.
+_SWAPPED_TAIL = re.compile(r'(\}+)"\s*$')
+#: Содержимое ```-блока как есть: _FENCED требует, чтобы блок кончался на }.
+_FENCE_BODY = re.compile(r"```(?:tool|json|tool_call)?\s*(.+?)```", re.DOTALL)
 
 SYSTEM_PROMPT = """Ты — автономный агент в Telegram. Ты не просто отвечаешь \
 текстом: у тебя есть инструменты, которыми ты выполняешь реальные действия \
@@ -138,6 +151,16 @@ FABRICATION_GUARD = (
     "Если инструментами задача не решается — так и скажи, честно и без цифр."
 )
 
+#: На финальном шаге модель всё равно прислала вызов, и после вычистки
+#: служебного блока текста не осталось. Данные при этом собраны — обиднее
+#: всего отдать пользователю «не успел», поэтому просим ещё раз и прямее.
+LAST_CALL_NUDGE = (
+    "Ты снова прислал вызов инструмента, но инструменты отключены: он не "
+    "выполнится, и пользователь увидит пустое сообщение. Ответь СЛОВАМИ, "
+    "обычным текстом, по данным, которые уже собраны выше. Без блоков, без "
+    "JSON, без упоминания инструментов."
+)
+
 NO_SKILLS_HINT = " (пока не добавлено ни одного — работай инструментами напрямую)"
 SKILLS_HINT = (
     " — если задача похожа на одну из них, ПЕРВЫМ делом прочитай инструкцию "
@@ -170,8 +193,8 @@ class AgentRun:
     #: Всё, что цикл добавил в контекст: вызовы, результаты, финальный ответ.
     trace: tuple[Message, ...] = ()
     steps: int = 0
-    #: answer — модель ответила сама; limit / deadline / repeat / empty —
-    #: сработал предохранитель.
+    #: answer — модель ответила сама; limit / deadline / repeat / stuck /
+    #: empty — сработал предохранитель.
     stopped: str = "answer"
 
 
@@ -256,7 +279,13 @@ def parse_tool_call(reply: str) -> ToolCall | None:
 
 
 def _repair(reply: str) -> ToolCall | None:
-    """Последняя попытка: вытащить вызов регулярками из битого JSON."""
+    """Последняя попытка: починить типовые поломки JSON от мелкой модели."""
+    for match in _FENCE_BODY.finditer(reply):
+        call = _normalize(_safe_json(_SWAPPED_TAIL.sub(r'"\1', match.group(1).strip())))
+        if call:
+            logger.info("Вызов разобран в щадящем режиме: кавычка стояла за скобками")
+            return call
+
     name = _LOOSE_NAME.search(reply)
     argument = _LOOSE_ARG.search(reply)
     if not name or not argument:
@@ -344,14 +373,22 @@ class Harness:
         last_call_failed = False
         guarded = False
         empty_replies = 0
+        stalled_steps = 0
+        forced_final = False
+        final_retried = False
 
         for step in range(1, self.max_steps + 1):
             out_of_time = time.monotonic() >= deadline
-            last_step = step == self.max_steps or out_of_time
+            last_step = step == self.max_steps or out_of_time or forced_final
             if last_step:
                 # Инструменты отключены: просим закрыть задачу тем, что есть.
                 context.append(Message("system", FINAL_NUDGE))
-                stopped = "deadline" if out_of_time else "limit"
+                if out_of_time:
+                    stopped = "deadline"
+                elif forced_final:
+                    stopped = "stuck"
+                else:
+                    stopped = "limit"
 
             logger.debug("Шаг %d/%d", step, self.max_steps)
             try:
@@ -377,6 +414,10 @@ class Harness:
                 # чтобы она переписала вызов, а не показываем битый JSON человеку.
                 logger.warning("Не разобран вызов инструмента на шаге %d", step)
                 last_call_failed = True
+                stalled_steps += 1
+                if stalled_steps >= MAX_STALLED_STEPS:
+                    logger.warning("Топтание на месте: требую финальный ответ")
+                    forced_final = True
                 observation = (
                     "ОШИБКА: не смог разобрать вызов инструмента. Пришли ровно "
                     "один блок ```tool с корректным JSON: кавычки внутри значения "
@@ -401,6 +442,22 @@ class Harness:
                     continue
 
                 text = strip_tool_blocks(reply) if last_step else reply.strip()
+
+                if not text and last_step and not final_retried:
+                    # Кроме вызова в ответе ничего не было. Данные собраны, и
+                    # менять тут нечего, кроме формулировки просьбы — спрашиваем
+                    # ещё раз, не тратя на это шаг: он всё равно последний.
+                    logger.warning("Финальный ответ пуст: прошу текст ещё раз")
+                    final_retried = True
+                    context.append(Message("assistant", reply.strip()))
+                    context.append(Message("system", LAST_CALL_NUDGE))
+                    try:
+                        text = strip_tool_blocks(
+                            strip_reasoning(self.provider.chat(context))
+                        )
+                    except EmptyAnswer:
+                        text = ""
+
                 if not text:
                     text = (
                         "Не успел довести задачу до конца за отведённые шаги. "
@@ -429,6 +486,13 @@ class Harness:
                 # Второй раз то же самое: данные у модели уже есть, ей не хватает
                 # не результата, а толчка к следующему шагу. Инструмент не трогаем.
                 logger.info("Повтор вызова %s: результат уже в контексте", call.short())
+                stalled_steps += 1
+                if stalled_steps >= MAX_STALLED_STEPS:
+                    # Повтор за повтором — модель пошла по кругу. Ждать потолка
+                    # шагов нечего: отключаем инструменты и просим ответ сейчас,
+                    # пока собранные данные ещё близко в контексте.
+                    logger.warning("Топтание на месте: требую финальный ответ")
+                    forced_final = True
                 trace.append(Message("assistant", reply.strip()))
                 trace.append(Message("tool", REPEAT_NOTE))
                 context.append(Message("assistant", reply.strip()))
@@ -439,6 +503,7 @@ class Harness:
             if self.on_step is not None:
                 self.on_step(call.short())
 
+            stalled_steps = 0
             observation, ok = self._invoke(call)
             tool_succeeded = tool_succeeded or ok
             last_call_failed = not ok

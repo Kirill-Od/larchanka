@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from bot.agent.harness import (
@@ -26,6 +28,7 @@ from bot.core.contracts import EmptyAnswer, LLMProvider, Message, Tool, ToolErro
 from bot.core.history import ConversationStore
 from bot.providers.ollama import DEFAULT_NUM_CTX, OllamaProvider
 from bot.tools.shell import ExecTool
+from bot.tools.skill import PROCEDURE_REMINDER, REFERENCE_REMINDER, SkillTool
 
 
 class ScriptedProvider(LLMProvider):
@@ -97,6 +100,20 @@ class ParserTest(unittest.TestCase):
                 self.assertEqual(parsed.name, "exec")
                 self.assertEqual(parsed.args.get("command"), "date")
 
+    def test_repairs_a_quote_that_ran_past_the_braces(self) -> None:
+        """Живая поломка qwen3:1.7b: …ru'}}" вместо …ru'"}}. JSON разваливается
+        целиком, и до этой починки прогон упирался в потолок шагов."""
+        broken = (
+            '```tool\n'
+            '{"tool": "exec", "args": {"command": "curl -s \'https://wttr.in/Minsk?0\'}}"\n'
+            "```"
+        )
+        parsed = parse_tool_call(broken)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.name, "exec")
+        self.assertEqual(parsed.args, {"command": "curl -s \'https://wttr.in/Minsk?0\'"})
+
     def test_plain_text_is_final_answer(self) -> None:
         self.assertIsNone(parse_tool_call("В Минске +17 °C, дождя нет."))
         self.assertIsNone(parse_tool_call('данные: {"temp": 17} — это не вызов'))
@@ -137,8 +154,11 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(run.stopped, "limit")
         # На последнем шаге инструменты отключены: вызовов на один меньше шагов.
         self.assertEqual(len(tool.calls), 4)
-        self.assertEqual(len(provider.seen), 5)
-        self.assertIn("Инструменты больше недоступны", provider.seen[-1][-1].content)
+        self.assertIn("Инструменты больше недоступны", provider.seen[4][-1].content)
+        # Шестое обращение — переспрос: на последнем шаге вместо текста снова
+        # пришёл вызов, и цикл дал модели ещё одну попытку ответить словами.
+        self.assertEqual(len(provider.seen), 6)
+        self.assertIn("Ответь СЛОВАМИ", provider.seen[-1][-1].content)
 
     def test_max_steps_is_capped(self) -> None:
         self.assertEqual(Harness(ScriptedProvider([]), max_steps=999).max_steps, 10)
@@ -164,6 +184,45 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(run.text, "Итог: pong #1")
         self.assertEqual(run.stopped, "answer")
         self.assertIn(REPEAT_NOTE, provider.seen[-1][-1].content)
+
+    def test_walking_in_circles_forces_an_early_answer(self) -> None:
+        """Собрав данные, модель любит начать процедуру скилла заново.
+        Ждать потолка шагов нечего — просим ответ, пока данные под рукой."""
+        tool = CountingTool()
+        provider = ScriptedProvider(
+            [call("ping", n=1), call("ping", n=2), call("ping", n=1), call("ping", n=2), "Сводка"]
+        )
+        run = Harness(provider, {"ping": tool}, max_steps=8).run([Message("user", "?")])
+
+        self.assertEqual(run.text, "Сводка")
+        self.assertEqual(run.stopped, "stuck")
+        self.assertEqual(run.steps, 5)  # а не 8: три шага сэкономлены
+        self.assertEqual(tool.calls, [{"n": 1}, {"n": 2}])  # повторы не выполнялись
+        self.assertIn("Инструменты больше недоступны", provider.seen[-1][-1].content)
+
+    def test_unparsable_calls_in_a_row_force_an_answer(self) -> None:
+        """Модель сорвалась в битый JSON и не выбирается: ответ текстом
+        полезнее, чем ещё пять попыток переписать вызов."""
+        broken = "```tool\nздесь должен был быть JSON, но его нет\n```"
+        provider = ScriptedProvider([broken, broken, "Ответ без инструментов"])
+        run = Harness(provider, {"ping": CountingTool()}, max_steps=8).run(
+            [Message("user", "?")]
+        )
+
+        self.assertEqual(run.text, "Ответ без инструментов")
+        self.assertEqual(run.stopped, "stuck")
+        self.assertEqual(run.steps, 3)  # а не 8
+
+    def test_final_step_answered_with_a_call_is_asked_again(self) -> None:
+        """На последнем шаге модель прислала вызов вместо текста. Данные
+        собраны — отдавать «не успел» вместо ответа было бы обидно."""
+        provider = ScriptedProvider([call("ping"), call("ping", n=2), "Сводка готова"])
+        run = Harness(provider, {"ping": CountingTool()}, max_steps=2).run(
+            [Message("user", "?")]
+        )
+
+        self.assertEqual(run.text, "Сводка готова")
+        self.assertIn("Ответь СЛОВАМИ", provider.seen[-1][-1].content)
 
     def test_tool_error_goes_back_to_model(self) -> None:
         provider = ScriptedProvider(
@@ -345,6 +404,33 @@ class SkillsTest(unittest.TestCase):
         self.assertIsNotNone(library.get("Morning-Briefing"))
         self.assertIsNotNone(library.get("weather-cli.md"))
         self.assertIsNone(library.get("нет такого"))
+
+
+class SkillKindTest(unittest.TestCase):
+    """Тип скилла решает, какое напоминание к нему приклеится."""
+
+    def test_kind_comes_from_frontmatter(self) -> None:
+        library = SkillLibrary.load()
+        self.assertEqual(library.get("morning-briefing").kind, "procedure")
+        self.assertEqual(library.get("weather-cli").kind, "reference")
+
+    def test_unknown_kind_falls_back_to_procedure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "s.md").write_text(
+                "---\nname: s\nkind: чепуха\ndescription: d\n---\n\nтело",
+                encoding="utf-8",
+            )
+            self.assertEqual(SkillLibrary.load(tmp).get("s").kind, "procedure")
+
+    def test_reference_is_not_told_to_start_with_step_one(self) -> None:
+        tool = SkillTool({})
+        procedure = tool.run({"name": "morning-briefing"})
+        reference = tool.run({"name": "weather-cli"})
+
+        self.assertIn(PROCEDURE_REMINDER, procedure)
+        self.assertIn(REFERENCE_REMINDER, reference)
+        # Главное: справочник не получает команду «начни с первого шага».
+        self.assertNotIn("первого шага", reference)
 
 
 class HistoryTest(unittest.TestCase):

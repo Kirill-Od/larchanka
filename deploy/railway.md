@@ -62,7 +62,6 @@ railway variables --set 'TELEGRAM_BOT_TOKEN=<токен от @BotFather>' \
                   --set 'LLM_PROVIDER=ollama' \
                   --set 'OLLAMA_MODEL=qwen3:1.7b' \
                   --set 'OLLAMA_NUM_THREAD=8' \
-                  --set 'OLLAMA_THINK=false' \
                   --set 'OLLAMA_NUM_CTX=8192' \
                   --set 'LLM_TIMEOUT=180' \
                   --set 'TELEGRAM_TRANSPORT=polling' \
@@ -88,8 +87,8 @@ Connection refused)`. Проверить, что реально простави
 | `AGENT_TASK_TIMEOUT=600` | Бюджет на весь запрос: несколько шагов по `LLM_TIMEOUT` каждый |
 | `EXEC_TIMEOUT=30` | Сеть из контейнера медленнее локальной, `curl` иногда не успевает за 20 с |
 | `EXEC_ALLOWED_BINARIES` | Строгий режим, если бот доступен не только тебе: `curl,cat,ls,date,head,grep,wc` |
-| `OLLAMA_THINK=false` | Размышления qwen3 на общем CPU — основная трата времени: 150 токенов там, где хватает 5 |
 | `OLLAMA_NUM_CTX=8192` | Ollama по умолчанию берёт 4096, и на финальном шаге контекст перестаёт влезать |
+| `OLLAMA_THINK` | **Не ставь `false` на qwen3:1.7b.** Быстрее втрое, но без размышлений модель перестаёт писать финальную сводку: команды выполняет, ответ — нет |
 
 Скиллы и `data/` уезжают внутрь образа (`COPY` в `Dockerfile`), отдельный volume
 им не нужен. Правка скилла = передеплой `railway up --service bot`. `curl` в образ
@@ -126,7 +125,8 @@ railway up --service bot
 все команды, а в чат прилетело `модель вернула пустой ответ`. Reasoning-модель
 пишет размышления в отдельное поле ответа, и если бюджет генерации кончился
 раньше, чем она перешла к тексту, `content` приходит пустым. Лечится
-`OLLAMA_THINK=false` и `OLLAMA_NUM_CTX=8192`.
+`OLLAMA_NUM_CTX=8192`: причина не в самих размышлениях, а в том, что контекст
+перестал влезать в дефолтные 4096 токенов.
 
 **Останови локального бота.** Два процесса с одним токеном конфликтуют: Telegram отдаёт
 апдейт только одному `getUpdates`. В логах это видно как `Конфликт getUpdates` (HTTP 409).

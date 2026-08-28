@@ -10,6 +10,9 @@ from bot.core.contracts import Message
 # Reasoning-модели (qwen3 и другие) пишут ход мысли в <think>...</think>.
 # Пользователю это отдавать не нужно, поэтому чистим на уровне ядра —
 # любой провайдер получает поведение бесплатно.
+# Ollama с версии 0.32 сама выносит размышления в отдельное поле ответа,
+# так что на этом пути тегов уже нет. Функция всё равно нужна: OpenAI-
+# совместимые серверы отдают их прямо в content, как и старые Ollama.
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _UNCLOSED_THINK = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
 
