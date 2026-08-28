@@ -25,7 +25,7 @@ date "+%A, %d %B %Y, %H:%M"
 ## Шаг 2. Погода
 
 ```
-curl -s "https://wttr.in/Minsk?0&T&M&lang=ru"
+curl -s "https://wttr.in/Antalya?0&T&M&lang=ru"
 ```
 
 Город по умолчанию Анталья; если пользователь назвал другой — подставь его.
