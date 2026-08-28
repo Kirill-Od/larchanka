@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-from bot.core.contracts import LLMError, LLMProvider, Message
+from bot.core.contracts import EmptyAnswer, LLMError, LLMProvider, Message
 from bot.core.text import strip_reasoning, to_api_messages
 from bot.providers import register
 from bot.providers._http import is_reachable, post_json
@@ -51,7 +51,7 @@ class OpenAICompatProvider(LLMProvider):
             raise LLMError("сервер не вернул ни одного варианта ответа")
         answer = strip_reasoning(choices[0].get("message", {}).get("content", ""))
         if not answer:
-            raise LLMError("модель вернула пустой ответ")
+            raise EmptyAnswer("модель вернула пустой ответ")
         return answer
 
     def health(self) -> bool:

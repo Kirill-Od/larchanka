@@ -62,6 +62,8 @@ railway variables --set 'TELEGRAM_BOT_TOKEN=<токен от @BotFather>' \
                   --set 'LLM_PROVIDER=ollama' \
                   --set 'OLLAMA_MODEL=qwen3:1.7b' \
                   --set 'OLLAMA_NUM_THREAD=8' \
+                  --set 'OLLAMA_THINK=false' \
+                  --set 'OLLAMA_NUM_CTX=8192' \
                   --set 'LLM_TIMEOUT=180' \
                   --set 'TELEGRAM_TRANSPORT=polling' \
                   --set 'ALLOWED_USER_IDS=<твой user_id>' \
@@ -86,6 +88,8 @@ Connection refused)`. Проверить, что реально простави
 | `AGENT_TASK_TIMEOUT=600` | Бюджет на весь запрос: несколько шагов по `LLM_TIMEOUT` каждый |
 | `EXEC_TIMEOUT=30` | Сеть из контейнера медленнее локальной, `curl` иногда не успевает за 20 с |
 | `EXEC_ALLOWED_BINARIES` | Строгий режим, если бот доступен не только тебе: `curl,cat,ls,date,head,grep,wc` |
+| `OLLAMA_THINK=false` | Размышления qwen3 на общем CPU — основная трата времени: 150 токенов там, где хватает 5 |
+| `OLLAMA_NUM_CTX=8192` | Ollama по умолчанию берёт 4096, и на финальном шаге контекст перестаёт влезать |
 
 Скиллы и `data/` уезжают внутрь образа (`COPY` в `Dockerfile`), отдельный volume
 им не нужен. Правка скилла = передеплой `railway up --service bot`. `curl` в образ
@@ -117,6 +121,12 @@ http://localhost:11434 ([Errno 111] Connection refused)`: бот стучитс�
 railway variables --service bot --set 'OLLAMA_URL=http://ollama.railway.internal:11434'
 railway up --service bot
 ```
+
+**Пустой ответ на последнем шаге.** Симптом — агент честно отработал скилл и
+все команды, а в чат прилетело `модель вернула пустой ответ`. Reasoning-модель
+пишет размышления в отдельное поле ответа, и если бюджет генерации кончился
+раньше, чем она перешла к тексту, `content` приходит пустым. Лечится
+`OLLAMA_THINK=false` и `OLLAMA_NUM_CTX=8192`.
 
 **Останови локального бота.** Два процесса с одним токеном конфликтуют: Telegram отдаёт
 апдейт только одному `getUpdates`. В логах это видно как `Конфликт getUpdates` (HTTP 409).

@@ -1,16 +1,43 @@
 """Провайдер локальной модели через Ollama (/api/generate).
 
-Настройки: OLLAMA_URL, OLLAMA_MODEL, OLLAMA_NUM_THREAD.
+Настройки: OLLAMA_URL, OLLAMA_MODEL, OLLAMA_NUM_THREAD, OLLAMA_NUM_CTX,
+OLLAMA_THINK.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-from bot.core.contracts import LLMError, LLMProvider, Message
+from bot.core.contracts import EmptyAnswer, LLMProvider, Message
 from bot.core.text import strip_reasoning, to_api_messages
 from bot.providers import register
 from bot.providers._http import is_reachable, post_json
+
+#: Ollama по умолчанию берёт 4096 токенов. Нам этого мало: в контексте лежат
+#: системный промпт, тело скилла (до 6000 символов) и вывод команд (до 4000
+#: на вызов). Переполнение съедает бюджет генерации, и модель возвращает
+#: пустой ответ ровно на финальном шаге, когда данные уже собраны.
+DEFAULT_NUM_CTX = 8192
+
+#: Целые опции Ollama: имя переменной окружения → имя поля в options.
+_INT_OPTIONS = {"OLLAMA_NUM_THREAD": "num_thread", "OLLAMA_NUM_CTX": "num_ctx"}
+
+_TRUE = ("1", "true", "yes", "on", "да")
+_FALSE = ("0", "false", "no", "off", "нет")
+
+
+def _parse_think(raw: str) -> bool | None:
+    """None — поля think в запросе не будет вовсе.
+
+    Модели без поддержки размышлений на это поле ругаются, поэтому по
+    умолчанию мы его не шлём: включается осознанно, под конкретную модель.
+    """
+    value = raw.strip().lower()
+    if value in _TRUE:
+        return True
+    if value in _FALSE:
+        return False
+    return None
 
 
 @register("ollama")
@@ -26,13 +53,20 @@ class OllamaProvider(LLMProvider):
         # хотя cgroup выделяет заметно меньше. Потоки начинают душить друг друга:
         # на Railway (48 ядер хоста, квота 24) это разница в 25 раз — 0.8 ток/с
         # против 20. Поэтому число потоков задаётся явно.
-        self._options: dict[str, int] = {}
-        threads = settings.get("OLLAMA_NUM_THREAD", "").strip()
-        if threads:
+        self._options: dict[str, int] = {"num_ctx": DEFAULT_NUM_CTX}
+        for key, option in _INT_OPTIONS.items():
+            raw = settings.get(key, "").strip()
+            if not raw:
+                continue
             try:
-                self._options["num_thread"] = int(threads)
+                self._options[option] = int(raw)
             except ValueError:
                 pass
+
+        # Размышления reasoning-моделей уходят в отдельное поле ответа, а не
+        # в content, и стоят дорого: qwen3:1.7b тратит на «привет» 150 токенов
+        # вместо 5. Выключение — самый дешёвый способ ускорить бота на CPU.
+        self._think = _parse_think(settings.get("OLLAMA_THINK", ""))
 
     @property
     def model(self) -> str:
@@ -59,6 +93,8 @@ class OllamaProvider(LLMProvider):
         payload: dict = {"model": self._model, "stream": False, **extra}
         if self._options:
             payload["options"] = self._options
+        if self._think is not None:
+            payload["think"] = self._think
         return payload
 
     def generate(self, prompt: str) -> str:
@@ -87,7 +123,8 @@ class OllamaProvider(LLMProvider):
     def _answer(raw: str) -> str:
         answer = strip_reasoning(raw)
         if not answer:
-            raise LLMError("модель вернула пустой ответ")
+            # Не LLMError: у харнесса на это есть отдельный сценарий.
+            raise EmptyAnswer("модель вернула пустой ответ")
         return answer
 
     def health(self) -> bool:

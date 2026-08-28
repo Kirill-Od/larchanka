@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from bot.agent.skills import SkillLibrary
-from bot.core.contracts import LLMProvider, Message, Tool, ToolError
+from bot.core.contracts import EmptyAnswer, LLMProvider, Message, Tool, ToolError
 from bot.core.text import strip_reasoning, truncate
 
 logger = logging.getLogger("agent.harness")
@@ -39,6 +39,8 @@ DEFAULT_MAX_STEPS = 8
 MAX_ALLOWED_STEPS = 10
 #: Сколько раз подряд терпим один и тот же вызов, прежде чем оборвать цикл.
 MAX_REPEATS = 2
+#: Сколько пустых ответов модели терпим, прежде чем свернуть задачу.
+MAX_EMPTY_REPLIES = 2
 #: Ограничение на результат одного вызова в контексте.
 MAX_OBSERVATION_CHARS = 4000
 
@@ -107,6 +109,13 @@ ERROR_NUDGE = (
     "значения запрещено: пока инструмент не отработал, данных у тебя нет."
 )
 
+#: Ответ на пустую реплику модели. Reasoning-модель способна потратить весь
+#: бюджет генерации на размышления и не написать ни слова: просим короче.
+EMPTY_NUDGE = (
+    "Твой прошлый ответ пришёл пустым: весь бюджет генерации ушёл на "
+    "размышления. Не рассуждай — напиши ответ сразу, коротко, обычным текстом."
+)
+
 #: Показывается модели, когда она «отвечает» после единственного упавшего
 #: вызова: собранных данных в этот момент нет, значит ответ выдуман.
 FABRICATION_GUARD = (
@@ -148,7 +157,8 @@ class AgentRun:
     #: Всё, что цикл добавил в контекст: вызовы, результаты, финальный ответ.
     trace: tuple[Message, ...] = ()
     steps: int = 0
-    #: answer — модель ответила сама; limit / deadline / repeat — сработал предохранитель.
+    #: answer — модель ответила сама; limit / deadline / repeat / empty —
+    #: сработал предохранитель.
     stopped: str = "answer"
 
 
@@ -320,6 +330,7 @@ class Harness:
         tool_succeeded = False
         last_call_failed = False
         guarded = False
+        empty_replies = 0
 
         for step in range(1, self.max_steps + 1):
             out_of_time = time.monotonic() >= deadline
@@ -330,7 +341,22 @@ class Harness:
                 stopped = "deadline" if out_of_time else "limit"
 
             logger.debug("Шаг %d/%d", step, self.max_steps)
-            reply = strip_reasoning(self.provider.chat(context))
+            try:
+                reply = strip_reasoning(self.provider.chat(context))
+            except EmptyAnswer:
+                # Осечка модели, а не отказ провайдера: собранные инструментами
+                # данные при ней целы, и выбрасывать их из-за одной пустой
+                # реплики нельзя — переспрашиваем.
+                empty_replies += 1
+                logger.warning(
+                    "Пустой ответ модели на шаге %d (%d из %d)",
+                    step, empty_replies, MAX_EMPTY_REPLIES,
+                )
+                if empty_replies >= MAX_EMPTY_REPLIES:
+                    break
+                context.append(Message("system", EMPTY_NUDGE))
+                continue
+
             call = None if last_step else parse_tool_call(reply)
 
             if call is None and not last_step and looks_like_tool_call(reply):
@@ -397,8 +423,14 @@ class Harness:
             context.append(Message("assistant", reply.strip()))
             context.append(Message("tool", observation))
 
-        # Сюда не попадаем: последний шаг всегда возвращает ответ.
-        raise AssertionError("агентный цикл завершился без ответа")
+        # Единственный выход из цикла без ответа: модель молчит раз за разом.
+        # Отдаём это как честную осечку, а не как отказ агента.
+        text = (
+            "Собрал данные, но модель не смогла оформить ответ: она возвращает "
+            "пустой текст. Повтори запрос — обычно со второго раза проходит."
+        )
+        trace.append(Message("assistant", text))
+        return AgentRun(text, tuple(trace), self.max_steps, "empty")
 
     def _invoke(self, call: ToolCall) -> tuple[str, bool]:
         """Возвращает наблюдение для модели и признак того, что вызов удался."""

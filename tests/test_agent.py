@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from bot.agent.harness import (
+    EMPTY_NUDGE,
     ERROR_NUDGE,
     FABRICATION_GUARD,
     Harness,
@@ -20,8 +21,9 @@ from bot.agent.harness import (
     strip_tool_blocks,
 )
 from bot.agent.skills import SkillLibrary
-from bot.core.contracts import LLMProvider, Message, Tool, ToolError
+from bot.core.contracts import EmptyAnswer, LLMProvider, Message, Tool, ToolError
 from bot.core.history import ConversationStore
+from bot.providers.ollama import DEFAULT_NUM_CTX, OllamaProvider
 from bot.tools.shell import ExecTool
 
 
@@ -43,7 +45,12 @@ class ScriptedProvider(LLMProvider):
     def chat(self, messages: Sequence[Message]) -> str:
         self.seen.append(list(messages))
         # Кончились заготовки — значит цикл сделал больше шагов, чем ожидалось.
-        return self.replies.pop(0) if self.replies else "финальный ответ по умолчанию"
+        reply = self.replies.pop(0) if self.replies else "финальный ответ по умолчанию"
+        if not reply:
+            # Пустая заготовка = модель промолчала, как это делает qwen3,
+            # когда весь бюджет генерации уходит на размышления.
+            raise EmptyAnswer("модель вернула пустой ответ")
+        return reply
 
 
 class CountingTool(Tool):
@@ -202,6 +209,28 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(run.text, "pong есть, остального нет")
         self.assertEqual(run.steps, 3)
 
+    def test_empty_reply_does_not_throw_away_collected_data(self) -> None:
+        """Модель промолчала на финальном шаге — данные, добытые инструментами,
+        обязаны пережить осечку: переспрашиваем, а не сдаёмся."""
+        tool = CountingTool()
+        provider = ScriptedProvider([call("ping"), "", "Итог: pong #1"])
+        run = Harness(provider, {"ping": tool}).run([Message("user", "пингани")])
+
+        self.assertEqual(run.text, "Итог: pong #1")
+        self.assertEqual(run.stopped, "answer")
+        self.assertEqual(tool.calls, [{}])
+        self.assertIn(EMPTY_NUDGE, provider.seen[-1][-1].content)
+
+    def test_persistent_silence_ends_with_an_honest_answer(self) -> None:
+        """Молчит раз за разом — говорим об этом прямо, а не «агент упал»."""
+        provider = ScriptedProvider([call("ping"), "", ""])
+        run = Harness(provider, {"ping": CountingTool()}).run([Message("user", "?")])
+
+        self.assertEqual(run.stopped, "empty")
+        self.assertIn("пустой текст", run.text)
+        # Вызов инструмента и его результат в трейсе, история не потеряна.
+        self.assertEqual([m.role for m in run.trace], ["assistant", "tool", "assistant"])
+
     def test_system_prompt_lists_tools_and_skills(self) -> None:
         harness = Harness(
             ScriptedProvider([]), {"ping": CountingTool()}, SkillLibrary.load(), max_steps=7
@@ -261,6 +290,32 @@ class ExecToolTest(unittest.TestCase):
         result = ExecTool({"EXEC_MAX_OUTPUT": "100"}).run({"command": "seq 1 5000"})
         self.assertLess(len(result), 300)
         self.assertIn("обрезан", result)
+
+
+class OllamaPayloadTest(unittest.TestCase):
+    """Тело запроса собирается без сети — проверяем именно его."""
+
+    @staticmethod
+    def _payload(**settings: str) -> dict:
+        return OllamaProvider(settings, 10)._payload({})
+
+    def test_context_is_widened_by_default(self) -> None:
+        # Дефолтных 4096 не хватает: тело скилла плюс вывод команд не влезают,
+        # и модель отдаёт пустой ответ ровно на финальном шаге.
+        self.assertEqual(self._payload()["options"]["num_ctx"], DEFAULT_NUM_CTX)
+        self.assertEqual(self._payload(OLLAMA_NUM_CTX="2048")["options"]["num_ctx"], 2048)
+
+    def test_broken_number_falls_back_to_default(self) -> None:
+        payload = self._payload(OLLAMA_NUM_CTX="много", OLLAMA_NUM_THREAD="8")
+        self.assertEqual(payload["options"]["num_ctx"], DEFAULT_NUM_CTX)
+        self.assertEqual(payload["options"]["num_thread"], 8)
+
+    def test_think_is_sent_only_when_asked(self) -> None:
+        # Модели без поддержки размышлений ругаются на само поле, поэтому
+        # по умолчанию его в запросе нет вовсе.
+        self.assertNotIn("think", self._payload())
+        self.assertIs(self._payload(OLLAMA_THINK="false")["think"], False)
+        self.assertIs(self._payload(OLLAMA_THINK="да")["think"], True)
 
 
 class SkillsTest(unittest.TestCase):
