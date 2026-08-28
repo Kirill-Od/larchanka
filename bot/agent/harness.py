@@ -49,6 +49,15 @@ MAX_STALLED_STEPS = 2
 MAX_EMPTY_REPLIES = 2
 #: Ограничение на результат одного вызова в контексте.
 MAX_OBSERVATION_CHARS = 4000
+#: Доля строк ответа, совпавших с последним результатом инструмента, начиная
+#: с которой это уже не пересказ, а копипаста. Мелкая модель, получив длинный
+#: текст (тело скилла, вывод curl), охотно возвращает его как «ответ».
+ECHO_LINE_RATIO = 0.6
+#: Короткие совпадения не считаем: «+38 °C» законно повторяет вывод команды.
+ECHO_MIN_CHARS = 300
+#: Этот инструмент приносит инструкцию, а не данные о мире. Отличать важно:
+#: прочитанный скилл — это план работы, и отвечать по нему нечего.
+SKILL_TOOL = "skill"
 
 _FENCED = re.compile(r"```(?:tool|json|tool_call)?\s*(\{.*?\})\s*```", re.DOTALL)
 _TAGGED = re.compile(r"<tool(?:_call)?[^>]*>\s*(\{.*?\})\s*</tool(?:_call)?>", re.DOTALL)
@@ -159,6 +168,28 @@ LAST_CALL_NUDGE = (
     "выполнится, и пользователь увидит пустое сообщение. Ответь СЛОВАМИ, "
     "обычным текстом, по данным, которые уже собраны выше. Без блоков, без "
     "JSON, без упоминания инструментов."
+)
+
+#: Модель прочитала инструкцию и на этом решила, что задача сделана. Данных
+#: при этом нет ни одного: скилл — это план, а не результат. Дальше мелкая
+#: модель заполняет шаблон из скилла правдоподобными числами, и пользователь
+#: получает выдуманную погоду вместо настоящей.
+NO_DATA_GUARD = (
+    "СТОП: ты прочитал инструкцию, но не выполнил из неё ни одной команды. "
+    "Инструкция — это план, а не данные: ни погоды, ни даты, ни дел у тебя "
+    "сейчас нет, и любые числа в ответе выше выдуманы. Пользователь его не "
+    "увидит. Выполни первую команду инструкции инструментом exec прямо сейчас."
+)
+
+#: Модель вернула результат инструмента вместо ответа. Для справочного скилла
+#: это типовая осечка мелкой модели: длинный текст в контексте выглядит
+#: убедительнее собственной формулировки. Пользователю такой «ответ» бесполезен.
+ECHO_GUARD = (
+    "СТОП: ты скопировал результат инструмента вместо ответа. Пользователь "
+    "не должен видеть ни служебный вывод, ни текст инструкции — он ждёт ответ "
+    "на свой вопрос. Если инструкция прочитана, но данных ещё нет — выполни "
+    "нужную команду инструментом exec. Если данные уже собраны — перескажи их "
+    "своими словами, в двух-трёх предложениях."
 )
 
 NO_SKILLS_HINT = " (пока не добавлено ни одного — работай инструментами напрямую)"
@@ -322,6 +353,22 @@ def strip_tool_blocks(reply: str) -> str:
 # --- цикл -----------------------------------------------------------------
 
 
+def _is_echo(reply: str, observation: str) -> bool:
+    """Ответ модели — копия результата инструмента, а не пересказ?
+
+    Сравниваем построчно: пересказ переформулирует, копипаста сохраняет строки
+    целиком. Порог по длине отсекает законные совпадения вроде «+38 °C».
+    """
+    if len(reply) < ECHO_MIN_CHARS or not observation:
+        return False
+    source = {line.strip() for line in observation.splitlines() if line.strip()}
+    lines = [line.strip() for line in reply.splitlines() if line.strip()]
+    if not lines:
+        return False
+    matched = sum(1 for line in lines if line in source)
+    return matched / len(lines) >= ECHO_LINE_RATIO
+
+
 def _failure(detail: str) -> str:
     """Единый вид неудачи инструмента: причина плюс запрет на выдумку."""
     return f"ОШИБКА: {detail}\n{ERROR_NUDGE}"
@@ -372,6 +419,17 @@ class Harness:
         tool_succeeded = False
         last_call_failed = False
         guarded = False
+        echo_guarded = False
+        no_data_guarded = False
+        #: Отработал ли инструмент, приносящий данные о мире. Чтение скилла
+        #: сюда не входит: инструкция — это план работы, а не её результат.
+        data_collected = False
+        #: Прочитан ли хоть один скилл: без этого модель не заявляла, что
+        #: задача требует шагов, и придираться к её ответу не за что.
+        skill_read = False
+        #: Последний успешный результат инструмента — с ним сверяем финальный
+        #: ответ на копипасту.
+        last_observation = ""
         empty_replies = 0
         stalled_steps = 0
         forced_final = False
@@ -441,6 +499,32 @@ class Harness:
                     context.append(Message("system", FABRICATION_GUARD))
                     continue
 
+                if not last_step and not echo_guarded and _is_echo(reply, last_observation):
+                    # Пользователю уехал бы служебный вывод или текст скилла.
+                    # Даём один шанс: обычно после нуджа модель либо выполняет
+                    # команду из прочитанной инструкции, либо пересказывает данные.
+                    logger.warning("Ответ повторяет результат инструмента — прошу пересказ")
+                    echo_guarded = True
+                    stalled_steps += 1
+                    context.append(Message("assistant", reply.strip()))
+                    context.append(Message("system", ECHO_GUARD))
+                    continue
+
+                if (
+                    not last_step
+                    and skill_read
+                    and not data_collected
+                    and not no_data_guarded
+                ):
+                    # Прочитан план, но не сделано ни шага: отвечать не по чему.
+                    logger.warning("Ответ по одной инструкции, без данных — это выдумка")
+                    no_data_guarded = True
+                    stalled_steps += 1
+                    # В trace не кладём: выдумка нужна модели, а не человеку.
+                    context.append(Message("assistant", reply.strip()))
+                    context.append(Message("system", NO_DATA_GUARD))
+                    continue
+
                 text = strip_tool_blocks(reply) if last_step else reply.strip()
 
                 if not text and last_step and not final_retried:
@@ -471,6 +555,7 @@ class Harness:
                     stopped="answer" if not last_step else stopped,
                 )
 
+            call = self._resolve(call)
             history.append(call.signature())
             repeats = history.count(call.signature())
             if repeats > MAX_REPEATS:
@@ -507,6 +592,12 @@ class Harness:
             observation, ok = self._invoke(call)
             tool_succeeded = tool_succeeded or ok
             last_call_failed = not ok
+            if ok:
+                last_observation = observation
+                if call.name == SKILL_TOOL:
+                    skill_read = True
+                else:
+                    data_collected = True
             trace.append(Message("assistant", reply.strip()))
             trace.append(Message("tool", observation))
             context.append(Message("assistant", reply.strip()))
@@ -521,10 +612,34 @@ class Harness:
         trace.append(Message("assistant", text))
         return AgentRun(text, tuple(trace), self.max_steps, "empty")
 
+    def _resolve(self, call: ToolCall) -> ToolCall:
+        """Чинит частую осечку: имя скилла, использованное как имя инструмента.
+
+        Намерение однозначное — модель хочет эту инструкцию, так что переписываем
+        вызов в чтение скилла вместо ответа «такого нет»: на отказ мелкая модель
+        уходит перебирать имена наугад и сжигает шаги.
+
+        Переписываем именно здесь, а не внутри _invoke: цикл считает по имени
+        вызова и повторы, и то, приносил ли шаг данные. Скрытая подмена внутри
+        _invoke означала бы, что чтение скилла засчитано как сбор данных, —
+        и защита от выдумки по одной инструкции молча перестаёт работать.
+        """
+        if call.name in self.tools or SKILL_TOOL not in self.tools:
+            return call
+        if self.skills is None or self.skills.get(call.name) is None:
+            return call
+        logger.info("Скилл %s вызван как инструмент — читаю его", call.name)
+        return ToolCall(SKILL_TOOL, {"name": call.name})
+
     def _invoke(self, call: ToolCall) -> tuple[str, bool]:
         """Возвращает наблюдение для модели и признак того, что вызов удался."""
         tool = self.tools.get(call.name)
         if tool is None:
+            if self.skills is not None and self.skills.get(call.name) is not None:
+                return _failure(
+                    f"{call.name!r} — это скилл, а не инструмент. "
+                    f"Команды выполняются инструментом exec"
+                ), False
             available = ", ".join(self.tools) or "—"
             return _failure(f"инструмента {call.name!r} нет. Доступны: {available}"), False
         try:

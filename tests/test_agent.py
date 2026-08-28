@@ -15,9 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from bot.agent.harness import (
+    ECHO_GUARD,
     EMPTY_NUDGE,
     ERROR_NUDGE,
     FABRICATION_GUARD,
+    NO_DATA_GUARD,
     REPEAT_NOTE,
     Harness,
     parse_tool_call,
@@ -76,6 +78,26 @@ class FailingTool(Tool):
 
     def run(self, args: Mapping[str, Any]) -> str:
         raise ToolError("так и было задумано")
+
+
+#: Вызов skill: helper call() занимает имя name под сам инструмент.
+SKILL_CALL = '```tool\n{"tool": "skill", "args": {"name": "weather-cli"}}\n```'
+
+#: Кусок настоящего скилла: длинный служебный текст, который мелкая модель
+#: норовит вернуть пользователю вместо ответа.
+INSTRUCTION = """Инструкция «weather-cli»:
+
+# Погода через wttr.in
+
+Сервис wttr.in отдаёт погоду обычным HTTP-запросом. Никаких ключей и
+регистрации не нужно — только curl через инструмент exec.
+
+Одна команда на все случаи, выполняй её как есть:
+
+    curl -s "https://wttr.in/Antalya?0&T&M&lang=ru"
+
+Каждый флаг обязателен: -s глушит служебный вывод curl, T убирает
+ANSI-раскраску, M даёт ветер в м/с, lang=ru — описание по-русски."""
 
 
 def call(name: str, **args: Any) -> str:
@@ -302,6 +324,156 @@ class HarnessTest(unittest.TestCase):
         self.assertIn("пустой текст", run.text)
         # Вызов инструмента и его результат в трейсе, история не потеряна.
         self.assertEqual([m.role for m in run.trace], ["assistant", "tool", "assistant"])
+
+    def test_answer_that_copies_the_tool_result_is_rejected(self) -> None:
+        """Мелкая модель любит вернуть прочитанный скилл как «ответ».
+        Пользователю служебный текст не нужен — просим пересказ."""
+
+        class SkillLikeTool(Tool):
+            name = "skill"
+            description = "выдаёт текст инструкции"
+
+            def run(self, args: Mapping[str, Any]) -> str:
+                return INSTRUCTION
+
+        provider = ScriptedProvider(
+            [SKILL_CALL, INSTRUCTION, call("ping"), "В Анталье +38, солнечно."]
+        )
+        tools = {"skill": SkillLikeTool({}), "ping": CountingTool()}
+        run = Harness(provider, tools).run([Message("user", "погода")])
+
+        self.assertEqual(run.text, "В Анталье +38, солнечно.")
+        self.assertIn(ECHO_GUARD, provider.seen[2][-1].content)
+        # Инструкция остаётся в трассировке ровно один раз — как результат
+        # вызова. Копия, которую модель выдала за ответ, в историю не уезжает.
+        echoes = [m for m in run.trace if m.role == "assistant" and "Каждый флаг" in m.content]
+        self.assertEqual(echoes, [])
+
+    def test_answer_from_the_instruction_alone_is_rejected(self) -> None:
+        """Скилл прочитан, но ни одной команды не выполнено. Числа в таком
+        ответе взяться неоткуда — это выдумка, и пользователю она не уедет."""
+
+        class SkillLikeTool(Tool):
+            name = "skill"
+            description = "выдаёт текст инструкции"
+
+            def run(self, args: Mapping[str, Any]) -> str:
+                return INSTRUCTION
+
+        provider = ScriptedProvider(
+            [
+                SKILL_CALL,
+                "Воскресенье, 15 октября, 22°C, дождь. Нужен зонт.",
+                call("ping"),
+                "В Анталье +38, солнечно.",
+            ]
+        )
+        tools = {"skill": SkillLikeTool({}), "ping": CountingTool()}
+        run = Harness(provider, tools).run([Message("user", "погода")])
+
+        self.assertEqual(run.text, "В Анталье +38, солнечно.")
+        self.assertIn(NO_DATA_GUARD, provider.seen[2][-1].content)
+        # Выдуманная погода в историю чата не попадает.
+        self.assertNotIn("15 октября", " ".join(m.content for m in run.trace))
+
+    def test_chatting_after_a_skill_is_not_blocked_forever(self) -> None:
+        """Придирка одноразовая: модель настояла — отдаём, спорить нечем."""
+
+        class SkillLikeTool(Tool):
+            name = "skill"
+            description = "выдаёт текст инструкции"
+
+            def run(self, args: Mapping[str, Any]) -> str:
+                return INSTRUCTION
+
+        provider = ScriptedProvider([SKILL_CALL, "первый ответ", "второй ответ"])
+        run = Harness(provider, {"skill": SkillLikeTool({})}).run([Message("user", "?")])
+
+        self.assertEqual(run.text, "второй ответ")
+        self.assertEqual(run.stopped, "answer")
+
+    def test_no_data_guard_is_silent_when_a_command_has_run(self) -> None:
+        """Команда отработала — данные есть, ответ законен."""
+        provider = ScriptedProvider([call("ping"), "Готово: pong получен."])
+        run = Harness(provider, {"ping": CountingTool()}).run([Message("user", "?")])
+
+        self.assertEqual(run.text, "Готово: pong получен.")
+        self.assertEqual(run.steps, 2)
+
+    def test_echo_guard_gives_exactly_one_chance(self) -> None:
+        """Модель повторила копипасту — спорить дальше нечем, отдаём как есть."""
+        provider = ScriptedProvider([call("ping"), "pong #1", "pong #1"])
+        run = Harness(provider, {"ping": CountingTool()}).run([Message("user", "?")])
+
+        self.assertEqual(run.stopped, "answer")
+
+    def test_short_answer_repeating_the_output_is_not_an_echo(self) -> None:
+        """«+38 °C» законно повторяет вывод команды: короткий ответ не трогаем."""
+        provider = ScriptedProvider([call("ping"), "pong #1"])
+        run = Harness(provider, {"ping": CountingTool()}).run([Message("user", "?")])
+
+        self.assertEqual(run.text, "pong #1")
+        self.assertEqual(run.steps, 2)
+
+    def test_skill_name_called_as_a_tool_reads_that_skill(self) -> None:
+        """Имя скилла — не имя инструмента, но намерение очевидно: модель
+        хочет инструкцию. Читаем её, а не отвечаем «такого нет»."""
+
+        class SkillLikeTool(Tool):
+            name = "skill"
+            description = "выдаёт текст инструкции"
+
+            def __init__(self) -> None:
+                super().__init__({})
+                self.asked: list[dict] = []
+
+            def run(self, args: Mapping[str, Any]) -> str:
+                self.asked.append(dict(args))
+                return INSTRUCTION
+
+        skill_tool = SkillLikeTool()
+        provider = ScriptedProvider(
+            [call("weather-cli", command="curl -s wttr.in"), "готово"]
+        )
+        harness = Harness(provider, {"skill": skill_tool}, skills=SkillLibrary.load())
+        harness.run([Message("user", "погода")])
+
+        self.assertEqual(skill_tool.asked, [{"name": "weather-cli"}])
+        self.assertIn("Каждый флаг обязателен", provider.seen[1][-1].content)
+
+    def test_skill_read_under_a_wrong_name_is_still_not_data(self) -> None:
+        """Вызов переписан в чтение скилла — значит это чтение и есть.
+        Если цикл продолжит считать его сбором данных, защита от выдумки
+        по одной инструкции молча отключается."""
+
+        class SkillLikeTool(Tool):
+            name = "skill"
+            description = "выдаёт текст инструкции"
+
+            def run(self, args: Mapping[str, Any]) -> str:
+                return INSTRUCTION
+
+        provider = ScriptedProvider(
+            [
+                call("weather-cli", command="curl -s wttr.in"),
+                "В Анталье +38, солнечно.",
+                call("ping"),
+                "В Анталье жарко.",
+            ]
+        )
+        tools = {"skill": SkillLikeTool({}), "ping": CountingTool()}
+        harness = Harness(provider, tools, skills=SkillLibrary.load())
+        run = harness.run([Message("user", "погода")])
+
+        self.assertIn(NO_DATA_GUARD, provider.seen[2][-1].content)
+        self.assertEqual(run.text, "В Анталье жарко.")
+
+    def test_unknown_name_that_is_not_a_skill_still_reports_available_tools(self) -> None:
+        provider = ScriptedProvider([call("нетакого"), "готово"])
+        harness = Harness(provider, {"ping": CountingTool()}, skills=SkillLibrary.load())
+        harness.run([Message("user", "?")])
+
+        self.assertIn("Доступны: ping", provider.seen[1][-1].content)
 
     def test_system_prompt_lists_tools_and_skills(self) -> None:
         harness = Harness(
