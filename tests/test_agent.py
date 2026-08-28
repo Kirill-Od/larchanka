@@ -16,6 +16,7 @@ from bot.agent.harness import (
     EMPTY_NUDGE,
     ERROR_NUDGE,
     FABRICATION_GUARD,
+    REPEAT_NOTE,
     Harness,
     parse_tool_call,
     strip_tool_blocks,
@@ -151,6 +152,18 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(run.stopped, "repeat")
         self.assertLess(run.steps, 5)
         self.assertIn("застрял", run.text)
+
+    def test_repeated_call_is_not_executed_twice(self) -> None:
+        """Повтор — это потерянный шаг и раздутый контекст: тело скилла,
+        прочитанное дважды, стоит дороже, чем толчок к следующему шагу."""
+        tool = CountingTool()
+        provider = ScriptedProvider([call("ping"), call("ping"), "Итог: pong #1"])
+        run = Harness(provider, {"ping": tool}).run([Message("user", "?")])
+
+        self.assertEqual(tool.calls, [{}])  # второй раз инструмент не звали
+        self.assertEqual(run.text, "Итог: pong #1")
+        self.assertEqual(run.stopped, "answer")
+        self.assertIn(REPEAT_NOTE, provider.seen[-1][-1].content)
 
     def test_tool_error_goes_back_to_model(self) -> None:
         provider = ScriptedProvider(
