@@ -20,11 +20,13 @@
 ```mermaid
 graph LR
     TG[TG app] <--> API[Telegram API]
-    API <--> P[polling]
-    API <--> W[webhook]
+    API --> P[polling]
+    API --> W[webhook]
     P --> H[MessageHandler]
     W --> H
     H <--> C[(Контекст чата)]
+    H --> TC[TelegramClient]
+    TC --> API
     H --> A[Процесс агента]
     subgraph A[Процесс агента]
         HR[Харнесс: агентный цикл]
